@@ -1,0 +1,183 @@
+"""
+Training Data Loader with Similarity-Based Construction (SBC) filtering.
+"""
+import os
+import pickle
+import collections
+import random
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+
+
+def _random_elements(lst, k):
+    """Sample k unique random elements from list."""
+    if k >= len(lst):
+        return lst.copy()
+    return random.sample(lst, k)
+
+
+class TrackDataset(torch.utils.data.Dataset):
+    """
+    Dataset for cross-modal (face-voice) training with pseudo-labels.
+    Supports SBC (Similarity-Based Construction) batch filtering.
+    """
+
+    def __init__(
+        self,
+        data_root,
+        features,
+        full_length,
+        big_batch,
+        batch_size,
+        batch_construction_mode,
+        pseudo_labels=None,
+        excluded_tracks=None
+    ):
+        self.data_root = data_root
+        self.features = features
+        self.batch_size = batch_size
+        self.big_batch_size = big_batch
+        self.pseudo_labels = pseudo_labels
+        self.actual_length = len(pseudo_labels) if pseudo_labels is not None else full_length
+        self.excluded_tracks = set(excluded_tracks) if excluded_tracks else set()
+
+        # Load dataset metadata
+        meta_path = os.path.join(data_root, "info", "train_valid_test_names.pkl")
+        with open(meta_path, 'rb') as f:
+            split_dict = pickle.load(f)
+        self.train_names = split_dict["train"]
+
+        name2tracks_path = os.path.join(data_root, "info", "name2tracks.pkl")
+        with open(name2tracks_path, 'rb') as f:
+            self.name2tracks = pickle.load(f)
+
+        # Build track list
+        all_tracks = []
+        for name in self.train_names:
+            all_tracks += self.name2tracks.get(name, [])
+
+        # Remove corrupted / excluded tracks
+        all_tracks = [t for t in all_tracks if t not in self.excluded_tracks]
+        self.all_tracks = all_tracks
+
+        # SBC mode
+        self.batch_construction_mode = batch_construction_mode
+        self.std_ratio = 0.0
+        if batch_construction_mode.startswith("sbc_"):
+            self.std_ratio = float(batch_construction_mode.split("_")[-1])
+            print("[Loader] SBC std_ratio =", self.std_ratio)
+
+        # Label placeholders (to be set externally)
+        self.pseudo_labels_gender = {}
+        self.pseudo_labels_nationality = {}
+        self.pseudo_labels_identity = {}
+
+    def __len__(self):
+        return self.actual_length
+
+    def _load_one(self, track):
+        """Load features for a single track."""
+        feat_path = os.path.join(
+            self.data_root, "features",
+            track.replace("/1.6/", "/") + "/compact.pkl"
+        )
+        with open(feat_path, 'rb') as f:
+            tmp_dict = pickle.load(f)
+        return [tmp_dict[f] for f in self.features]
+
+    def _track_names_to_batch(self, need_tracks, track2array):
+        result = collections.defaultdict(list)
+        assert len(need_tracks) == self.batch_size
+        for track in need_tracks:
+            array = track2array[track]
+            for i in range(len(self.features)):
+                result[i].append(array[i])
+        data = [np.array(result[i]) for i in range(len(self.features))]
+        data = [torch.FloatTensor(d) for d in data]
+        return data
+
+    def _calc_repeat_rate(self, tracks):
+        names = set([t.split("/")[0] for t in tracks])
+        return 1.0 - len(names) / len(tracks)
+
+    def _load_big_batch(self):
+        big_tracks = _random_elements(self.all_tracks, self.big_batch_size)
+        face_list, voice_list, track2array = [], [], {}
+        for track in big_tracks:
+            array = self._load_one(track)
+            track2array[track] = array
+            face_list.append(array[0])      # first feature: face
+            voice_list.append(array[-2])    # second-to-last: voice
+        return big_tracks, face_list, voice_list, track2array
+
+    def _filter_by_sbc(self, tracks, face_list, voice_list):
+        """Similarity-Based Construction filtering."""
+        face_batch = np.array(face_list)
+        voice_batch = np.array(voice_list)
+        face_sim = face_batch @ face_batch.T
+        voice_sim = voice_batch @ voice_batch.T
+        sim_cated = np.array([face_sim, voice_sim])
+        sim_matrix = np.min(sim_cated, axis=0)
+
+        np.fill_diagonal(sim_matrix, 0)
+        stat_min = sim_matrix.mean()
+        stat_std = sim_matrix.std()
+        threshold = stat_min + self.std_ratio * stat_std
+
+        filtered_tracks = [tracks[0]]
+        has_names = {tracks[0].split("/")[0]}
+
+        for i in range(1, len(tracks)):
+            track = tracks[i]
+            cur_name = track.split("/")[0]
+            if cur_name in has_names:
+                sub_array = sim_matrix[i][0:i]
+                sub_array_max = sub_array.max()
+                if sub_array_max <= threshold:
+                    filtered_tracks.append(track)
+                    has_names.add(cur_name)
+                else:
+                    sim_matrix[:, i] = 0
+            else:
+                filtered_tracks.append(track)
+                has_names.add(cur_name)
+
+            if len(filtered_tracks) == self.batch_size:
+                break
+        return filtered_tracks
+
+    def __getitem__(self, index):
+        big_tracks, face_list, voice_list, track2array = self._load_big_batch()
+
+        # Apply SBC filter if enabled, otherwise take first batch_size
+        if self.batch_construction_mode.startswith("sbc_"):
+            tracks = self._filter_by_sbc(big_tracks, face_list, voice_list)
+        else:
+            tracks = big_tracks[0:self.batch_size]
+
+        data = self._track_names_to_batch(tracks, track2array)
+
+        rate_before = self._calc_repeat_rate(big_tracks)
+        rate_after = self._calc_repeat_rate(tracks)
+        the_index = big_tracks.tolist().index(tracks[-1]) if hasattr(big_tracks, 'tolist') else 0
+
+        info = {
+            "loader/before": rate_before,
+            "loader/after": rate_after,
+            "loader/desc": rate_before - rate_after,
+            "loader/endIndex": the_index,
+        }
+
+        # Load auxiliary pseudo-labels if available
+        label_gender = [self.pseudo_labels_gender.get(key, 0) for key in tracks]
+        label_nationality = [self.pseudo_labels_nationality.get(key, 0) for key in tracks]
+        label_identity = [self.pseudo_labels_identity.get(key, 0) for key in tracks]
+
+        tensor_labels = [
+            torch.tensor(label_gender, dtype=torch.long).unsqueeze(1),
+            torch.tensor(label_nationality, dtype=torch.long).unsqueeze(1),
+            torch.tensor(label_identity, dtype=torch.long).unsqueeze(1)
+        ]
+
+        return data, tensor_labels, info
